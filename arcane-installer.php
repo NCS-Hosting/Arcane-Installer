@@ -6,6 +6,9 @@
 declare(strict_types=1);
 
 const API_BASE = 'https://license.ncshosting.org/api/1.2/';
+// Hardcoded application identifiers per requirements
+const OWNER_ID = 'ivOVJDbwto';
+const APP_NAME = 'Arcane';
 
 function println(string $msg = ''): void {
     fwrite(STDOUT, $msg . PHP_EOL);
@@ -22,23 +25,9 @@ function prompt(string $msg): string {
 }
 
 function usage(): void {
-    println('Arcane Installer CLI');
-    println('Usage: php arcane-installer.php <command> [options]');
-    println('Commands:');
-    println('  install       Install the extension package');
-    println('  uninstall     Uninstall using local manifest');
-    println('  update        Update to latest eligible version');
-    println('  autoupdate    Non-interactive update (cron-friendly)');
-    println('Options (all commands):');
-    println('  --path=<panel-path>             Pterodactyl panel root path');
-    println('  --key=<license-key>             License key');
-    println('  --ownerid=<ownerid>             Application ownerid (10 chars)');
-    println('  --name=<name>                   Application name');
-    println('  --enckey=<encryption-key>       Encryption key (optional)');
-    println('  --non-interactive               Fail instead of prompting');
-    println('  --download-token=<token>        Optional download token');
-    println('  --hwid=<hwid>                   Optional HWID binding value');
-    println('  --log=<file>                    Log file path (default: arcane-installer.log)');
+    println('Arcane Installer');
+    println('Run: php tools/customer-installer/arcane-installer.php');
+    println('Follow interactive prompts to install, update, or uninstall.');
 }
 
 function isWindows(): bool {
@@ -71,13 +60,7 @@ function rrmdir(string $dir): void {
     @rmdir($dir);
 }
 
-function parseArgs(): array {
-    $longopts = [
-        'path:', 'key:', 'ownerid:', 'name:', 'enckey:', 'non-interactive', 'download-token:', 'hwid:', 'log:'
-    ];
-    $opts = getopt('', $longopts);
-    return $opts ?: [];
-}
+// No CLI arguments are supported; installer is fully interactive.
 
 function ensureHttps(string $url): void {
     if (stripos($url, 'https://') !== 0) {
@@ -234,10 +217,7 @@ function checkPreflight(string $panelPath): void {
     }
 }
 
-function resolvePanelPath(?string $given, bool $nonInteractive): string {
-    if ($given && $given !== '') {
-        return rtrim($given, DIRECTORY_SEPARATOR);
-    }
+function resolvePanelPathInteractive(): string {
     $cwd = getcwd();
     $candidate = $cwd;
     $markers = ['artisan', 'app', 'config'];
@@ -246,10 +226,8 @@ function resolvePanelPath(?string $given, bool $nonInteractive): string {
         if (!file_exists($candidate . DIRECTORY_SEPARATOR . $m)) { $isPanel = false; break; }
     }
     if ($isPanel) {
+        println('Detected panel at current directory: ' . $candidate);
         return $candidate;
-    }
-    if ($nonInteractive) {
-        throw new RuntimeException('Panel path not provided and auto-detect failed.');
     }
     $input = prompt('Enter Pterodactyl panel root path:');
     return rtrim($input, DIRECTORY_SEPARATOR);
@@ -300,12 +278,7 @@ function verifyFilesAgainstManifest(string $rootDir, array $manifest): void {
         if (!file_exists($src)) {
             throw new RuntimeException('Missing package file: ' . $src);
         }
-        if (!empty($f['sha256'])) {
-            $hash = hash_file('sha256', $src);
-            if (!hash_equals($hash, $f['sha256'])) {
-                throw new RuntimeException('Hash mismatch for ' . $f['source']);
-            }
-        }
+        // Checksums are intentionally not verified per requirements.
     }
 }
 
@@ -379,28 +352,24 @@ function uninstallUsingManifest(string $panelPath, array $manifest, ?string $log
     println('Run optional cleanup: php artisan cache:clear');
 }
 
-function commandInstall(array $opts, bool $nonInteractive): int {
+function commandInstallInteractive(): int {
     requireRoot();
-    $ownerid = $opts['ownerid'] ?? '';
-    $name = $opts['name'] ?? '';
-    $enckey = $opts['enckey'] ?? null;
-    $key = $opts['key'] ?? '';
-    $panelPath = resolvePanelPath($opts['path'] ?? null, $nonInteractive);
-    $logFile = $opts['log'] ?? null;
-
-    if ($ownerid === '' || $name === '') {
-        throw new RuntimeException('Missing required parameters: --ownerid and --name');
-    }
-    if ($key === '') {
-        if ($nonInteractive) throw new RuntimeException('Missing --key in non-interactive mode');
-        $key = prompt('Enter license key:');
-    }
+    println('Starting Arcane install');
+    $panelPath = resolvePanelPathInteractive();
+    $logFile = null; // default arcane-installer.log
+    $key = prompt('Enter license key:');
+    $enckeyInput = prompt('Enter encryption key (optional, press Enter to skip):');
+    $enckey = $enckeyInput !== '' ? $enckeyInput : null;
+    $hwidInput = prompt('Enter HWID (optional, press Enter to skip):');
+    $hwid = $hwidInput !== '' ? $hwidInput : null;
+    $downloadTokenInput = prompt('Enter download token (optional, press Enter to skip):');
+    $downloadToken = $downloadTokenInput !== '' ? $downloadTokenInput : null;
 
     checkPreflight($panelPath);
     writeLog($logFile, 'Preflight checks passed for ' . $panelPath);
 
     // Init session (no version known for fresh install)
-    $init = initSession($ownerid, $name, null, $enckey);
+    $init = initSession(OWNER_ID, APP_NAME, null, $enckey);
     if (!($init['success'] ?? false)) {
         throw new RuntimeException('Init failed: ' . ($init['message'] ?? 'unknown'));
     }
@@ -408,7 +377,7 @@ function commandInstall(array $opts, bool $nonInteractive): int {
     if (!$sessionid) throw new RuntimeException('No sessionid returned');
 
     // License verify
-    $lic = licenseLogin($sessionid, $key, $opts['hwid'] ?? null, $enckey);
+    $lic = licenseLogin($sessionid, $key, $hwid, $enckey);
     if (!($lic['success'] ?? false)) {
         throw new RuntimeException('License validation failed: ' . ($lic['message'] ?? 'unknown'));
     }
@@ -417,7 +386,7 @@ function commandInstall(array $opts, bool $nonInteractive): int {
     $tmpDir = sys_get_temp_dir() . DIRECTORY_SEPARATOR . 'arcane_installer_' . uniqid();
     mkdir($tmpDir);
     $pkgFile = $tmpDir . DIRECTORY_SEPARATOR . 'package.zip';
-    downloadPackage($key, $ownerid, $name, $sessionid, $opts['download-token'] ?? null, $opts['hwid'] ?? null, $pkgFile);
+    downloadPackage($key, OWNER_ID, APP_NAME, $sessionid, $downloadToken, $hwid, $pkgFile);
     writeLog($logFile, 'Downloaded package to ' . $pkgFile);
 
     // Extract and read package manifest
@@ -449,9 +418,10 @@ function commandInstall(array $opts, bool $nonInteractive): int {
     return 0;
 }
 
-function commandUninstall(array $opts, bool $nonInteractive): int {
-    $panelPath = resolvePanelPath($opts['path'] ?? null, $nonInteractive);
-    $logFile = $opts['log'] ?? null;
+function commandUninstallInteractive(): int {
+    println('Starting Arcane uninstall');
+    $panelPath = resolvePanelPathInteractive();
+    $logFile = null;
     $manifest = loadLocalManifest($panelPath);
     if (!$manifest) { throw new RuntimeException('No local manifest found.'); }
     uninstallUsingManifest($panelPath, $manifest, $logFile);
@@ -460,32 +430,27 @@ function commandUninstall(array $opts, bool $nonInteractive): int {
     return 0;
 }
 
-function commandUpdate(array $opts, bool $nonInteractive, bool $auto): int {
+function commandUpdateInteractive(bool $auto): int {
     requireRoot();
-    $ownerid = $opts['ownerid'] ?? '';
-    $name = $opts['name'] ?? '';
-    $enckey = $opts['enckey'] ?? null;
-    $key = $opts['key'] ?? '';
-    $panelPath = resolvePanelPath($opts['path'] ?? null, $nonInteractive);
-    $logFile = $opts['log'] ?? null;
-
-    if ($ownerid === '' || $name === '') {
-        throw new RuntimeException('Missing required parameters: --ownerid and --name');
-    }
-    if ($key === '') {
-        if ($nonInteractive || $auto) throw new RuntimeException('Missing --key for update');
-        $key = prompt('Enter license key:');
-    }
-
-    checkPreflight($panelPath);
+    println('Starting Arcane update');
+    $panelPath = resolvePanelPathInteractive();
+    $logFile = null;
     $local = loadLocalManifest($panelPath);
     if (!$local) { throw new RuntimeException('Local manifest missing. Run install first.'); }
     $currentVer = $local['version'] ?? null;
+    $enckeyInput = prompt('Enter encryption key (optional, press Enter to skip):');
+    $enckey = $enckeyInput !== '' ? $enckeyInput : null;
+    $key = prompt('Enter license key:');
+    $hwidInput = prompt('Enter HWID (optional, press Enter to skip):');
+    $hwid = $hwidInput !== '' ? $hwidInput : null;
+    $downloadTokenInput = prompt('Enter download token (optional, press Enter to skip):');
+    $downloadToken = $downloadTokenInput !== '' ? $downloadTokenInput : null;
+
+    checkPreflight($panelPath);
 
     // Init with current version to detect mismatch
-    $init = initSession($ownerid, $name, $currentVer, $enckey);
+    $init = initSession(OWNER_ID, APP_NAME, $currentVer, $enckey);
     if (($init['success'] ?? false) === false && ($init['message'] ?? '') === 'invalidver') {
-        // Update available
         writeLog($logFile, 'Update available. Downloading...');
     } else if (($init['success'] ?? false) === true) {
         println('No update available.');
@@ -497,18 +462,15 @@ function commandUpdate(array $opts, bool $nonInteractive, bool $auto): int {
     // Validate license
     $sessionid = $init['sessionid'] ?? null;
     if (!$sessionid) {
-        // If no session, perform a fresh init without version
-        $init2 = initSession($ownerid, $name, null, $enckey);
+        $init2 = initSession(OWNER_ID, APP_NAME, null, $enckey);
         if (!($init2['success'] ?? false)) throw new RuntimeException('Init failed');
         $sessionid = $init2['sessionid'] ?? null;
     }
-    $lic = licenseLogin($sessionid, $key, $opts['hwid'] ?? null, $enckey);
-
+    $lic = licenseLogin($sessionid, $key, $hwid, $enckey);
     if (!($lic['success'] ?? false)) { throw new RuntimeException('License validation failed'); }
 
     // Backup current state
     $backupTar = $panelPath . DIRECTORY_SEPARATOR . 'storage' . DIRECTORY_SEPARATOR . 'app' . DIRECTORY_SEPARATOR . 'arcane_installer' . DIRECTORY_SEPARATOR . 'backup_' . date('Ymd_His') . '.zip';
-    // Minimal backup: repackage installed files
     $zip = new ZipArchive();
     if ($zip->open($backupTar, ZipArchive::CREATE) === true) {
         foreach ($local['files'] as $f) {
@@ -524,7 +486,7 @@ function commandUpdate(array $opts, bool $nonInteractive, bool $auto): int {
     $tmpDir = sys_get_temp_dir() . DIRECTORY_SEPARATOR . 'arcane_installer_' . uniqid();
     mkdir($tmpDir);
     $pkgFile = $tmpDir . DIRECTORY_SEPARATOR . 'package.zip';
-    downloadPackage($key, $ownerid, $name, $sessionid, $opts['download-token'] ?? null, $opts['hwid'] ?? null, $pkgFile);
+    downloadPackage($key, OWNER_ID, APP_NAME, $sessionid, $downloadToken, $hwid, $pkgFile);
     $pkgRoot = $tmpDir . DIRECTORY_SEPARATOR . 'pkg';
     extractZip($pkgFile, $pkgRoot);
     $manifestPath = $pkgRoot . DIRECTORY_SEPARATOR . 'package.manifest.json';
@@ -534,7 +496,6 @@ function commandUpdate(array $opts, bool $nonInteractive, bool $auto): int {
 
     // Apply mapping
     $backups = applyInstallMapping($panelPath, $pkgRoot, $manifest, $logFile);
-    // Update local manifest
     $installedManifest = [
         'installed_at' => time(),
         'version' => $manifest['version'] ?? 'unknown',
@@ -544,32 +505,33 @@ function commandUpdate(array $opts, bool $nonInteractive, bool $auto): int {
     saveLocalManifest($panelPath, $installedManifest);
     writeLog($logFile, 'Update completed to version: ' . ($installedManifest['version'] ?? 'unknown'));
     println('Update completed.');
-    // Cleanup temp
     @unlink($pkgFile);
     rrmdir($tmpDir);
     return 0;
 }
 
 function main(): int {
-    $argv = $_SERVER['argv'];
-    if (count($argv) < 2) { usage(); return 1; }
-    $command = $argv[1];
-    $opts = parseArgs();
-    $nonInteractive = array_key_exists('non-interactive', $opts);
+    usage();
+    println('Choose an action:');
+    println('  1) Install');
+    println('  2) Uninstall');
+    println('  3) Update');
+    println('  4) Exit');
+    $choice = prompt('Enter choice number:');
     try {
-        switch ($command) {
-            case 'install':
-                return commandInstall($opts, $nonInteractive);
-            case 'uninstall':
-                return commandUninstall($opts, $nonInteractive);
-            case 'update':
-                return commandUpdate($opts, $nonInteractive, false);
-            case 'autoupdate':
-                return commandUpdate($opts, true, true);
-            case 'help':
-            default:
-                usage();
+        switch (trim($choice)) {
+            case '1':
+                return commandInstallInteractive();
+            case '2':
+                return commandUninstallInteractive();
+            case '3':
+                return commandUpdateInteractive(false);
+            case '4':
+                println('Goodbye.');
                 return 0;
+            default:
+                println('Invalid choice.');
+                return 1;
         }
     } catch (Throwable $e) {
         eprintln('Error: ' . $e->getMessage());
